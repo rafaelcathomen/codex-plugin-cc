@@ -151,7 +151,9 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(readme, /continue a previous Codex task with `--resume`/i);
   assert.match(readme, /supports `--background`, `--wait`, `--no-monitor`, `--resume`, `--fresh`, `--model`, and `--effort`/i);
   assert.match(readme, /starts a fresh one-shot handoff/i);
+  assert.match(readme, /press `a` or Enter in the sidecar to attach/i);
   assert.match(readme, /pass `--no-monitor` when you want a silent handoff/i);
+  assert.match(readme, /npm run sync-active-plugin/i);
   assert.match(readme, /### `\/codex:setup`/);
   assert.match(readme, /### `\/codex:review`/);
   assert.match(readme, /### `\/codex:adversarial-review`/);

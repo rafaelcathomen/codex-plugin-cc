@@ -160,8 +160,14 @@ Ask Codex to redesign the database connection to be more resilient.
 
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
-- the sidecar is a monitor window; use `codex resume <thread>` from its attach line when you want to interfere directly
+- the sidecar is a monitor window; press `a` or Enter in the sidecar to attach to `codex resume <thread>` when you want to interfere directly
 - pass `--no-monitor` when you want a silent handoff without the sidecar window
+
+For Rafael's personal checkout, sync the tested plugin into the active Claude Code install with:
+
+```bash
+npm run sync-active-plugin
+```
 
 ### `/codex:status`
 

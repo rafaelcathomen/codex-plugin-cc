@@ -70,6 +70,8 @@ const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
+const CODEX_ATTACH_COMMAND = process.env.CODEX_CLI_PATH || "/home/rafael/.local/bin/codex";
+let monitorAttachActive = false;
 
 function printUsage() {
   console.log(
@@ -1415,12 +1417,13 @@ function renderMonitorScreen(snapshot, options = {}) {
   }
 
   if (footerLines) {
+    const attachHint = snapshot?.job?.threadId ? "a/Enter attach  " : "";
     const position = maxScroll > 0
       ? `${scrollOffset + 1}-${Math.min(contentLines.length, scrollOffset + viewportHeight)}/${contentLines.length}`
       : `1-${contentLines.length}/${contentLines.length}`;
     const controls = maxScroll > 0
-      ? `Scroll ${position}  wheel ↑/↓ PgUp/PgDn Home/End  q quit`
-      : `q quit`;
+      ? `Scroll ${position}  wheel up/down PgUp/PgDn Home/End  ${attachHint}q quit`
+      : `${attachHint}q quit`;
     visibleLines.push(dim(controls));
   }
 
@@ -1432,19 +1435,86 @@ function renderMonitorScreen(snapshot, options = {}) {
   };
 }
 
-function enterMonitorScreen() {
+function createMonitorScreen() {
   if (!process.stdout.isTTY) {
-    return () => {};
+    return {
+      enter() {},
+      leave() {}
+    };
   }
-  process.stdout.write("\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?25l\x1b[2J\x1b[H");
-  let cleaned = false;
-  return () => {
-    if (cleaned) {
-      return;
+  let active = false;
+  return {
+    enter() {
+      if (active) {
+        return;
+      }
+      active = true;
+      process.stdout.write("\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?25l\x1b[2J\x1b[H");
+    },
+    leave() {
+      if (!active) {
+        return;
+      }
+      active = false;
+      process.stdout.write("\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l");
     }
-    cleaned = true;
-    process.stdout.write("\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l");
   };
+}
+
+function enterMonitorScreen() {
+  const screen = createMonitorScreen();
+  screen.enter();
+  return screen;
+}
+
+function waitForChildExit(child) {
+  return new Promise((resolve) => {
+    child.once("error", (error) => {
+      resolve({ code: 1, signal: null, error });
+    });
+    child.once("exit", (code, signal) => {
+      resolve({ code, signal, error: null });
+    });
+  });
+}
+
+async function runMonitorAttach(cwd, threadId, screen) {
+  if (!threadId) {
+    return;
+  }
+
+  screen.leave();
+  process.stdout.write(`Attaching to Codex thread ${threadId}. Exit Codex to return to the sidecar.\n\n`);
+
+  monitorAttachActive = true;
+  try {
+    const child = spawn(CODEX_ATTACH_COMMAND, ["resume", threadId], {
+      cwd,
+      env: process.env,
+      stdio: "inherit",
+      windowsHide: true
+    });
+    const result = await waitForChildExit(child);
+    if (result.error) {
+      process.stderr.write(`Failed to attach Codex: ${result.error.message}\n`);
+      await sleep(1500);
+    } else if (result.code && result.code !== 0) {
+      process.stderr.write(`Codex attach exited with code ${result.code}.\n`);
+      await sleep(1000);
+    }
+  } finally {
+    monitorAttachActive = false;
+    screen.enter();
+  }
+}
+
+function restoreRawMode(previousRawMode) {
+  if (!process.stdin.isTTY) {
+    return;
+  }
+  if (typeof process.stdin.setRawMode === "function") {
+    process.stdin.setRawMode(Boolean(previousRawMode));
+  }
 }
 
 function renderMonitorFrame(rendered) {
@@ -1483,10 +1553,15 @@ function installMonitorCleanup(cwd, restoreScreen = () => {}) {
     restoreScreen();
   };
   process.once("exit", cleanup);
-  process.once("SIGINT", () => {
+  const handleSigint = () => {
+    if (monitorAttachActive) {
+      process.once("SIGINT", handleSigint);
+      return;
+    }
     cleanup();
     process.exit(0);
-  });
+  };
+  process.once("SIGINT", handleSigint);
   process.once("SIGTERM", () => {
     cleanup();
     process.exit(0);
@@ -1522,6 +1597,11 @@ function interpretMonitorKey(chunk) {
     case "Q":
     case "\u0003":
       return { type: "quit" };
+    case "a":
+    case "A":
+    case "\r":
+    case "\n":
+      return { type: "attach" };
     case "\u001b[A":
     case "k":
       return { type: "scroll", delta: -1 };
@@ -1552,7 +1632,9 @@ function installMonitorKeyControls(onAction) {
     return () => {};
   }
   const previousRawMode = process.stdin.isRaw;
-  process.stdin.setRawMode(true);
+  if (typeof process.stdin.setRawMode === "function") {
+    process.stdin.setRawMode(true);
+  }
   process.stdin.setEncoding("utf8");
   process.stdin.resume();
   const onData = (chunk) => {
@@ -1564,7 +1646,7 @@ function installMonitorKeyControls(onAction) {
   process.stdin.on("data", onData);
   return () => {
     process.stdin.off("data", onData);
-    process.stdin.setRawMode(Boolean(previousRawMode));
+    restoreRawMode(previousRawMode);
     process.stdin.pause();
   };
 }
@@ -1582,8 +1664,8 @@ async function handleMonitor(argv) {
     throw new Error("monitor requires a job id. Run /codex:status to list jobs.");
   }
 
-  const restoreScreen = sessionMode ? enterMonitorScreen() : () => {};
-  const cleanupMonitor = sessionMode ? installMonitorCleanup(cwd, restoreScreen) : () => {};
+  const screen = sessionMode ? enterMonitorScreen() : createMonitorScreen();
+  const cleanupMonitor = sessionMode ? installMonitorCleanup(cwd, () => screen.leave()) : () => {};
 
   const pollIntervalMs = Math.max(100, Number(options["poll-interval-ms"]) || 250);
   let lastRendered = "";
@@ -1591,6 +1673,7 @@ async function handleMonitor(argv) {
   let maxScroll = 0;
   let forceRender = true;
   let shouldQuit = false;
+  let attachRequested = false;
   let lastSnapshot = null;
 
   const renderNow = () => {
@@ -1607,38 +1690,58 @@ async function handleMonitor(argv) {
     }
   };
 
-  const cleanupKeys = sessionMode
-    ? installMonitorKeyControls((action) => {
-        const pageSize = Math.max(1, terminalHeight() - 4);
-        switch (action.type) {
-          case "quit":
-            shouldQuit = true;
-            break;
-          case "scroll":
-            scrollOffset = clampScrollOffset(scrollOffset + action.delta, maxScroll);
-            break;
-          case "page":
-            scrollOffset = clampScrollOffset(scrollOffset + action.direction * pageSize, maxScroll);
-            break;
-          case "home":
-            scrollOffset = 0;
-            break;
-          case "end":
-            scrollOffset = maxScroll;
-            break;
-          default:
-            break;
-        }
-        forceRender = true;
-        renderNow();
-      })
-    : () => {};
+  let cleanupKeys = () => {};
+  const installKeys = () => {
+    cleanupKeys = sessionMode
+      ? installMonitorKeyControls((action) => {
+          const pageSize = Math.max(1, terminalHeight() - 4);
+          switch (action.type) {
+            case "quit":
+              shouldQuit = true;
+              break;
+            case "attach":
+              if (lastSnapshot?.job?.threadId) {
+                attachRequested = true;
+              }
+              break;
+            case "scroll":
+              scrollOffset = clampScrollOffset(scrollOffset + action.delta, maxScroll);
+              break;
+            case "page":
+              scrollOffset = clampScrollOffset(scrollOffset + action.direction * pageSize, maxScroll);
+              break;
+            case "home":
+              scrollOffset = 0;
+              break;
+            case "end":
+              scrollOffset = maxScroll;
+              break;
+            default:
+              break;
+          }
+          forceRender = true;
+          renderNow();
+        })
+      : () => {};
+  };
+  installKeys();
 
   try {
     while (true) {
       lastSnapshot = buildMonitorSnapshot(cwd, reference, { session: sessionMode });
       forceRender = forceRender || Boolean(lastSnapshot.job && isActiveJobStatus(lastSnapshot.job.status));
       renderNow();
+
+      if (attachRequested) {
+        attachRequested = false;
+        const threadId = lastSnapshot?.job?.threadId ?? null;
+        cleanupKeys();
+        lastRendered = "";
+        forceRender = true;
+        await runMonitorAttach(cwd, threadId, screen);
+        installKeys();
+        continue;
+      }
 
       const active = lastSnapshot.job ? isActiveJobStatus(lastSnapshot.job.status) : false;
       if (shouldQuit || !options.follow || (!sessionMode && !active)) {
