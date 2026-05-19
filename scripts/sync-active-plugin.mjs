@@ -9,13 +9,14 @@ import { fileURLToPath } from "node:url";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DEFAULT_SOURCE = path.join(ROOT, "plugins", "codex");
 const DEFAULT_MARKETPLACE_DEST = "/home/rafael/.claude/plugins/marketplaces/openai-codex/plugins/codex";
-const DEFAULT_CACHE_DEST = "/home/rafael/.claude/plugins/cache/openai-codex/codex/1.0.3";
+const INSTALLED_PLUGINS_FILE = path.join(os.homedir(), ".claude", "plugins", "installed_plugins.json");
+const CODEX_PLUGIN_KEY = "codex@openai-codex";
 
 function parseArgs(argv) {
   const options = {
     source: DEFAULT_SOURCE,
     marketplace: DEFAULT_MARKETPLACE_DEST,
-    cache: DEFAULT_CACHE_DEST,
+    cache: null,
     dryRun: false,
     skipMarketplace: false,
     skipCache: false,
@@ -68,6 +69,7 @@ function requireValue(argv, index, option) {
 }
 
 function printUsage() {
+  const defaultCache = resolveInstalledCodexCachePath() ?? "<active codex@openai-codex installPath>";
   console.log(`Usage: node scripts/sync-active-plugin.mjs [options]
 
 Copies plugins/codex from this checkout into the active Claude plugin install.
@@ -75,11 +77,27 @@ Copies plugins/codex from this checkout into the active Claude plugin install.
 Options:
   --source <path>        Source plugin root. Default: ${DEFAULT_SOURCE}
   --marketplace <path>   Marketplace destination. Default: ${DEFAULT_MARKETPLACE_DEST}
-  --cache <path>         Cache destination. Default: ${DEFAULT_CACHE_DEST}
+  --cache <path>         Cache destination. Default: ${defaultCache}
   --skip-marketplace     Do not sync the marketplace destination.
   --skip-cache           Do not sync the cache destination.
   --dry-run              Print planned copies without changing files.
 `);
+}
+
+function resolveInstalledCodexCachePath() {
+  try {
+    const manifest = JSON.parse(fs.readFileSync(INSTALLED_PLUGINS_FILE, "utf8"));
+    const installs = manifest?.plugins?.[CODEX_PLUGIN_KEY];
+    if (!Array.isArray(installs) || installs.length === 0) {
+      return null;
+    }
+    const sorted = installs
+      .filter((entry) => entry?.installPath)
+      .sort((left, right) => String(right.lastUpdated ?? "").localeCompare(String(left.lastUpdated ?? "")));
+    return sorted[0]?.installPath ? path.resolve(sorted[0].installPath) : null;
+  } catch {
+    return null;
+  }
 }
 
 function assertPluginRoot(source) {
@@ -136,6 +154,13 @@ function main() {
   const options = parseArgs(process.argv.slice(2));
   const source = path.resolve(options.source);
   assertPluginRoot(source);
+
+  if (!options.skipCache && !options.cache) {
+    options.cache = resolveInstalledCodexCachePath();
+    if (!options.cache) {
+      throw new Error(`Could not resolve ${CODEX_PLUGIN_KEY} from ${INSTALLED_PLUGINS_FILE}; pass --cache explicitly.`);
+    }
+  }
 
   if (!options.skipMarketplace) {
     syncOne(source, options.marketplace, options);

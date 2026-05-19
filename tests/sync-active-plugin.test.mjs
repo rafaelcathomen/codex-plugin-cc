@@ -52,3 +52,41 @@ test("sync-active-plugin dry-run does not modify destinations", () => {
   assert.equal(fs.existsSync(marketplace), false);
   assert.equal(fs.existsSync(cache), false);
 });
+
+test("sync-active-plugin resolves the active cache path from Claude installed plugins", () => {
+  const temp = makeTempDir();
+  const home = path.join(temp, "home");
+  const cache = path.join(temp, "active-cache", "openai-codex", "codex", "1.0.4");
+  const manifestDir = path.join(home, ".claude", "plugins");
+  fs.mkdirSync(manifestDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(manifestDir, "installed_plugins.json"),
+    `${JSON.stringify(
+      {
+        version: 2,
+        plugins: {
+          "codex@openai-codex": [
+            {
+              installPath: cache,
+              version: "1.0.4",
+              lastUpdated: "2026-05-19T16:27:13.054Z"
+            }
+          ]
+        }
+      },
+      null,
+      2
+    )}\n`
+  );
+
+  const result = run("node", [SCRIPT, "--skip-marketplace"], {
+    env: {
+      ...process.env,
+      HOME: home
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /synced .*1\.0\.4/);
+  assert.equal(fs.existsSync(path.join(cache, "scripts", "codex-companion.mjs")), true);
+});
