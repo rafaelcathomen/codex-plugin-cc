@@ -584,6 +584,8 @@ export function buildEnv(binDir) {
   const sep = process.platform === "win32" ? ";" : ":";
   return {
     ...process.env,
-    PATH: `${binDir}${sep}${process.env.PATH}`
+    PATH: `${binDir}${sep}${process.env.PATH}`,
+    CODEX_CLI_PATH: path.join(binDir, "codex"),
+    CODEX_COMPANION_OPEN_MONITOR: "0"
   };
 }

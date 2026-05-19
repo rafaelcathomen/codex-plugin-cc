@@ -125,19 +125,19 @@ This command is read-only. It does not fix code.
 
 ### `/codex:rescue`
 
-Hands a task to Codex through the `codex:codex-rescue` subagent.
+Hands a task to Codex through the companion runtime and opens a visible sidecar monitor by default.
 
 Use it when you want Codex to:
 
 - investigate a bug
 - try a fix
-- continue a previous Codex task
+- continue a previous Codex task with `--resume`
 - take a faster or cheaper pass with a smaller model
 
 > [!NOTE]
 > Depending on the task and the model you choose these tasks might take a long time and it's generally recommended to force the task to be in the background or move the agent to the background.
 
-It supports `--background`, `--wait`, `--resume`, and `--fresh`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo.
+It supports `--background`, `--wait`, `--no-monitor`, `--resume`, `--fresh`, `--model`, and `--effort`. If you omit `--resume` and `--fresh`, `/codex:rescue` starts a fresh one-shot handoff so repeated commands are predictable.
 
 Examples:
 
@@ -160,7 +160,8 @@ Ask Codex to redesign the database connection to be more resilient.
 
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
-- follow-up rescue requests can continue the latest Codex task in the repo
+- the sidecar is a monitor window; use `codex resume <thread>` from its attach line when you want to interfere directly
+- pass `--no-monitor` when you want a silent handoff without the sidecar window
 
 ### `/codex:status`
 

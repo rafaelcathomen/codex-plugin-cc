@@ -40,6 +40,7 @@ import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
+const CODEX_COMMAND = process.env.CODEX_CLI_PATH || "/home/rafael/.local/bin/codex";
 const TASK_THREAD_PREFIX = "Codex Companion Task";
 const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
@@ -232,6 +233,18 @@ function registerThread(state, threadId, options = {}) {
   }
 }
 
+function summarizeChangedFiles(changes = []) {
+  const files = changes
+    .map((change) => change?.path ?? change?.filePath ?? change?.relativePath ?? change?.uri ?? null)
+    .filter(Boolean)
+    .map((value) => String(value));
+  if (files.length === 0) {
+    return "";
+  }
+  const preview = files.slice(0, 3).join(", ");
+  return files.length > 3 ? `${preview}, +${files.length - 3} more` : preview;
+}
+
 function describeStartedItem(state, item) {
   switch (item.type) {
     case "enteredReviewMode":
@@ -241,8 +254,10 @@ function describeStartedItem(state, item) {
         message: `Running command: ${shorten(item.command, 96)}`,
         phase: looksLikeVerificationCommand(item.command) ? "verifying" : "running"
       };
-    case "fileChange":
-      return { message: `Applying ${item.changes.length} file change(s).`, phase: "editing" };
+    case "fileChange": {
+      const files = summarizeChangedFiles(item.changes);
+      return { message: `Applying ${item.changes.length} file change(s)${files ? `: ${files}` : ""}.`, phase: "editing" };
+    }
     case "mcpToolCall":
       return { message: `Calling ${item.server}/${item.tool}.`, phase: "investigating" };
     case "dynamicToolCall":
@@ -272,8 +287,10 @@ function describeCompletedItem(state, item) {
         phase: looksLikeVerificationCommand(item.command) ? "verifying" : "running"
       };
     }
-    case "fileChange":
-      return { message: `File changes ${item.status}.`, phase: "editing" };
+    case "fileChange": {
+      const files = summarizeChangedFiles(item.changes);
+      return { message: `File changes ${item.status}${files ? `: ${files}` : ""}.`, phase: "editing" };
+    }
     case "mcpToolCall":
       return { message: `Tool ${item.server}/${item.tool} ${item.status}.`, phase: "investigating" };
     case "dynamicToolCall":
@@ -790,12 +807,12 @@ async function getCodexAuthStatusFromClient(client, cwd) {
 }
 
 export function getCodexAvailability(cwd) {
-  const versionStatus = binaryAvailable("codex", ["--version"], { cwd });
+  const versionStatus = binaryAvailable(CODEX_COMMAND, ["--version"], { cwd });
   if (!versionStatus.available) {
     return versionStatus;
   }
 
-  const appServerStatus = binaryAvailable("codex", ["app-server", "--help"], { cwd });
+  const appServerStatus = binaryAvailable(CODEX_COMMAND, ["app-server", "--help"], { cwd });
   if (!appServerStatus.available) {
     return {
       available: false,

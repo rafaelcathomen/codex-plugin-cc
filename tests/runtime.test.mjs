@@ -1932,17 +1932,22 @@ test("stop hook does not block when Codex is unavailable even if the review gate
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
+  const unavailableEnv = {
+    ...process.env,
+    PATH: "",
+    CODEX_CLI_PATH: path.join(repo, "missing-codex"),
+    CODEX_COMPANION_OPEN_MONITOR: "0"
+  };
+
   const setup = run(process.execPath, [SCRIPT, "setup", "--enable-review-gate", "--json"], {
-    cwd: repo
+    cwd: repo,
+    env: unavailableEnv
   });
   assert.equal(setup.status, 0, setup.stderr);
 
   const allowed = run(process.execPath, [STOP_HOOK], {
     cwd: repo,
-    env: {
-      ...process.env,
-      PATH: ""
-    },
+    env: unavailableEnv,
     input: JSON.stringify({ cwd: repo })
   });
 

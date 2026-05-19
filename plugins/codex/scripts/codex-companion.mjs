@@ -28,6 +28,7 @@ import {
   generateJobId,
   getConfig,
   listJobs,
+  resolveStateDir,
   setConfig,
   upsertJob,
   writeJobFile
@@ -77,7 +78,8 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--no-monitor] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs monitor [job-id] [--session] [--follow] [--hold]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
@@ -485,7 +487,7 @@ async function executeTaskRun(request) {
     defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
     model: request.model,
     effort: request.effort,
-    sandbox: request.write ? "workspace-write" : "read-only",
+    sandbox: request.write ? "danger-full-access" : "read-only",
     onProgress: request.onProgress,
     persistThread: true,
     threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
@@ -551,7 +553,8 @@ function buildTaskRunMetadata({ prompt, resumeLast = false }) {
 }
 
 function renderQueuedTaskLaunch(payload) {
-  return `${payload.title} started in the background as ${payload.jobId}. Check /codex:status ${payload.jobId} for progress.\n`;
+  const monitor = payload.monitorOpened ? " A Codex sidecar terminal is open." : "";
+  return `${payload.title} started in the background as ${payload.jobId}.${monitor} Check /codex:status ${payload.jobId} for progress.\n`;
 }
 
 function getJobKindLabel(kind, jobClass) {
@@ -584,6 +587,166 @@ function createTrackedProgress(job, options = {}) {
       onEvent: createJobProgressUpdater(job.workspaceRoot, job.id)
     })
   };
+}
+
+function shouldOpenMonitor(options = {}) {
+  if (options.json || options.noMonitor || process.env.CODEX_COMPANION_OPEN_MONITOR === "0") {
+    return false;
+  }
+  if (String(options.prompt ?? "").includes(STOP_REVIEW_TASK_MARKER)) {
+    return false;
+  }
+  return process.platform === "linux";
+}
+
+function sanitizeMonitorKey(value) {
+  const normalized = String(value ?? "workspace")
+    .replace(/[^a-zA-Z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 96);
+  return normalized || "workspace";
+}
+
+function getMonitorSessionKey() {
+  return sanitizeMonitorKey(getCurrentClaudeSessionId() ?? "workspace");
+}
+
+function getSessionMonitorFile(cwd) {
+  return path.join(resolveStateDir(cwd), `monitor-${getMonitorSessionKey()}.json`);
+}
+
+function getSessionMonitorTargetFile(cwd) {
+  return path.join(resolveStateDir(cwd), `monitor-${getMonitorSessionKey()}-target.json`);
+}
+
+function readJsonFile(filePath) {
+  try {
+    if (!fs.existsSync(filePath)) {
+      return null;
+    }
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function readSessionMonitorRecord(cwd) {
+  return readJsonFile(getSessionMonitorFile(cwd));
+}
+
+function readSessionMonitorTarget(cwd) {
+  return readJsonFile(getSessionMonitorTargetFile(cwd));
+}
+
+function writeSessionMonitorTarget(cwd, jobId) {
+  fs.mkdirSync(resolveStateDir(cwd), { recursive: true });
+  fs.writeFileSync(
+    getSessionMonitorTargetFile(cwd),
+    `${JSON.stringify(
+      {
+        jobId,
+        sessionId: getCurrentClaudeSessionId(),
+        workspaceRoot: resolveWorkspaceRoot(cwd),
+        updatedAt: nowIso()
+      },
+      null,
+      2
+    )}
+`,
+    "utf8"
+  );
+}
+
+function isProcessAlive(pid) {
+  const numericPid = Number(pid);
+  if (!Number.isInteger(numericPid) || numericPid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(numericPid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function writeSessionMonitorRecord(cwd, record) {
+  fs.mkdirSync(resolveStateDir(cwd), { recursive: true });
+  fs.writeFileSync(getSessionMonitorFile(cwd), `${JSON.stringify(record, null, 2)}\n`, "utf8");
+}
+
+function removeSessionMonitorRecord(cwd, pid = process.pid) {
+  const monitorFile = getSessionMonitorFile(cwd);
+  const existing = readJsonFile(monitorFile);
+  if (existing && Number(existing.pid) !== Number(pid)) {
+    return;
+  }
+  try {
+    fs.unlinkSync(monitorFile);
+  } catch {
+    // Nothing to clean up.
+  }
+}
+
+function openMonitorTerminal(cwd, jobId, options = {}) {
+  if (!shouldOpenMonitor(options)) {
+    return false;
+  }
+
+  writeSessionMonitorTarget(cwd, jobId);
+
+  const existingMonitor = readSessionMonitorRecord(cwd);
+  if (isProcessAlive(existingMonitor?.pid)) {
+    appendLogLine(options.logFile, `Reusing existing Codex sidecar terminal for ${jobId}.`);
+    return true;
+  }
+
+  const alacritty = binaryAvailable("alacritty", ["--version"], { cwd });
+  if (!alacritty.available) {
+    appendLogLine(options.logFile, `Monitor terminal not opened: alacritty ${alacritty.detail}.`);
+    return false;
+  }
+
+  const scriptPath = path.join(ROOT_DIR, "scripts", "codex-companion.mjs");
+  const child = spawn(
+    "alacritty",
+    [
+      "--title",
+      "Codex Sidecar",
+      "--option",
+      "window.padding.x=10",
+      "--option",
+      "window.padding.y=8",
+      "-e",
+      process.execPath,
+      scriptPath,
+      "monitor",
+      "--cwd",
+      cwd,
+      "--session",
+      "--follow"
+    ],
+    {
+      cwd,
+      env: process.env,
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true
+    }
+  );
+  child.unref();
+
+  if (child.pid) {
+    writeSessionMonitorRecord(cwd, {
+      pid: child.pid,
+      sessionId: getCurrentClaudeSessionId(),
+      workspaceRoot: resolveWorkspaceRoot(cwd),
+      openedAt: nowIso()
+    });
+  }
+
+  appendLogLine(options.logFile, `Opened Codex sidecar terminal for ${jobId}.`);
+  return true;
 }
 
 function buildTaskJob(workspaceRoot, taskMetadata, write) {
@@ -630,7 +793,23 @@ async function runForegroundCommand(job, runner, options = {}) {
     logFile: options.logFile,
     stderr: !options.json
   });
-  const execution = await runTrackedJob(job, () => runner(progress), { logFile });
+  const pendingRecord = {
+    ...job,
+    status: "queued",
+    phase: "queued",
+    pid: process.pid,
+    logFile
+  };
+  writeJobFile(job.workspaceRoot, job.id, pendingRecord);
+  upsertJob(job.workspaceRoot, pendingRecord);
+  openMonitorTerminal(options.cwd ?? job.workspaceRoot, job.id, {
+    json: options.json,
+    noMonitor: options.noMonitor,
+    prompt: options.prompt,
+    logFile
+  });
+
+  const execution = await runTrackedJob({ ...job, logFile }, () => runner(progress), { logFile });
   outputResult(options.json ? execution.payload : execution.rendered, options.json);
   if (execution.exitStatus !== 0) {
     process.exitCode = execution.exitStatus;
@@ -718,7 +897,7 @@ async function handleReviewCommand(argv, config) {
         reviewName: config.reviewName,
         onProgress: progress
       }),
-    { json: options.json }
+    { json: options.json, noMonitor: true }
   );
 }
 
@@ -732,7 +911,7 @@ async function handleReview(argv) {
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "effort", "cwd", "prompt-file"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "no-monitor"],
     aliasMap: {
       m: "model"
     }
@@ -750,6 +929,7 @@ async function handleTask(argv) {
     throw new Error("Choose either --resume/--resume-last or --fresh.");
   }
   const write = Boolean(options.write);
+  const noMonitor = Boolean(options["no-monitor"]);
   const taskMetadata = buildTaskRunMetadata({
     prompt,
     resumeLast
@@ -770,7 +950,14 @@ async function handleTask(argv) {
       jobId: job.id
     });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
-    outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
+    const monitorOpened = openMonitorTerminal(cwd, job.id, {
+      json: options.json,
+      noMonitor,
+      prompt,
+      logFile: payload.logFile
+    });
+    const launchPayload = { ...payload, monitorOpened };
+    outputCommandResult(launchPayload, renderQueuedTaskLaunch(launchPayload), options.json);
     return;
   }
 
@@ -788,8 +975,687 @@ async function handleTask(argv) {
         jobId: job.id,
         onProgress: progress
       }),
-    { json: options.json }
+    {
+      cwd,
+      json: options.json,
+      noMonitor,
+      prompt
+    }
   );
+}
+
+function terminalStyle(code, text) {
+  if (!process.stdout.isTTY || process.env.NO_COLOR) {
+    return text;
+  }
+  return `\x1b[${code}m${text}\x1b[0m`;
+}
+
+function bold(text) {
+  return terminalStyle("1", text);
+}
+
+function dim(text) {
+  return terminalStyle("90", text);
+}
+
+function statusColor(status) {
+  switch (status) {
+    case "completed":
+      return "32";
+    case "failed":
+    case "cancelled":
+      return "31";
+    case "queued":
+      return "33";
+    case "running":
+      return "36";
+    default:
+      return "37";
+  }
+}
+
+function compactLine(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function truncateLine(value, limit) {
+  const text = String(value ?? "");
+  if (text.length <= limit) {
+    return text;
+  }
+  return `${text.slice(0, Math.max(0, limit - 3))}...`;
+}
+
+function terminalWidth() {
+  return Math.max(72, Math.min(Number(process.stdout.columns) || 100, 140));
+}
+
+function terminalHeight() {
+  return Math.max(24, Number(process.stdout.rows) || 36);
+}
+
+function wrapText(value, width, maxLines = 3) {
+  const text = compactLine(value);
+  if (!text) {
+    return [];
+  }
+  const words = text.split(" ");
+  const lines = [];
+  let current = "";
+
+  for (const word of words) {
+    const next = current ? `${current} ${word}` : word;
+    if (next.length <= width) {
+      current = next;
+      continue;
+    }
+    if (current) {
+      lines.push(current);
+      current = word;
+    } else {
+      lines.push(truncateLine(word, width));
+      current = "";
+    }
+    if (lines.length >= maxLines) {
+      break;
+    }
+  }
+
+  if (current && lines.length < maxLines) {
+    lines.push(current);
+  }
+
+  if (lines.length === maxLines && words.join(" ").length > lines.join(" ").length) {
+    lines[lines.length - 1] = truncateLine(lines[lines.length - 1], Math.max(4, width - 3)) + "...";
+  }
+
+  return lines;
+}
+
+function readLogText(logFile, maxBytes = 64000) {
+  if (!logFile || !fs.existsSync(logFile)) {
+    return "";
+  }
+  const stat = fs.statSync(logFile);
+  const start = Math.max(0, stat.size - maxBytes);
+  const fd = fs.openSync(logFile, "r");
+  try {
+    const buffer = Buffer.alloc(stat.size - start);
+    fs.readSync(fd, buffer, 0, buffer.length, start);
+    return buffer.toString("utf8");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function parseTimestampedLogLine(line) {
+  const match = /^\[(\d{4}-\d{2}-\d{2}T(\d{2}:\d{2}:\d{2})(?:\.\d+)?Z)\]\s*(.*)$/.exec(line);
+  if (!match) {
+    return null;
+  }
+  return { iso: match[1], time: match[2], message: match[3].trim() };
+}
+
+function summarizeActivityMessage(message) {
+  if (!message) {
+    return null;
+  }
+  if (/^(Opened|Reusing existing) Codex sidecar terminal/.test(message)) {
+    return null;
+  }
+  if (/^(Thread ready|Turn started|Turn completed)\b/.test(message)) {
+    return null;
+  }
+  if (/^Starting Codex Task\.$/.test(message)) {
+    return "Started Codex handoff";
+  }
+  if (/^Starting Codex task thread\.$/.test(message)) {
+    return "Started task thread";
+  }
+  if (/^Assistant message captured:/.test(message)) {
+    return "Codex wrote a response";
+  }
+  if (/^Applying \d+ file change/.test(message)) {
+    return message.replace(/\.$/, "");
+  }
+  if (/^File changes completed\.$/.test(message)) {
+    return "File changes completed";
+  }
+  const runMatch = /^Running command:\s*(.*)$/.exec(message);
+  if (runMatch) {
+    return `Run: ${runMatch[1]}`;
+  }
+  const doneMatch = /^Command completed:.*\(exit (\d+)\)$/.exec(message);
+  if (doneMatch) {
+    return `Command finished, exit ${doneMatch[1]}`;
+  }
+  if (/^(Final output|Assistant message|Reasoning summary)$/.test(message)) {
+    return null;
+  }
+  return message;
+}
+
+function limitTail(lines, maxLines) {
+  if (!Number.isFinite(maxLines) || maxLines <= 0) {
+    return lines;
+  }
+  return lines.slice(-maxLines);
+}
+
+function readActivityEntries(logFile, maxLines = Number.POSITIVE_INFINITY) {
+  const logText = readLogText(logFile);
+  if (!logText) {
+    return [];
+  }
+  const entries = logText
+    .split(/\r?\n/)
+    .map(parseTimestampedLogLine)
+    .filter(Boolean)
+    .map((entry) => {
+      const summary = summarizeActivityMessage(entry.message);
+      return summary ? { ...entry, summary } : null;
+    })
+    .filter(Boolean);
+  return limitTail(entries, maxLines);
+}
+
+function readActivityLines(logFile, maxLines = Number.POSITIVE_INFINITY) {
+  return readActivityEntries(logFile, maxLines).map((entry) => `${entry.time}  ${entry.summary}`);
+}
+
+function formatAge(iso) {
+  const timestamp = Date.parse(iso ?? "");
+  if (!Number.isFinite(timestamp)) {
+    return "unknown age";
+  }
+  const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+  if (seconds < 2) {
+    return "just now";
+  }
+  if (seconds < 60) {
+    return `${seconds}s ago`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) {
+    return `${minutes}m ago`;
+  }
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ago`;
+}
+
+function formatPhaseLabel(job) {
+  const phase = String(job?.phase ?? "").toLowerCase();
+  switch (phase) {
+    case "queued":
+      return "Queued";
+    case "starting":
+      return "Starting Codex";
+    case "investigating":
+      return "Inspecting context";
+    case "editing":
+      return "Editing files";
+    case "running":
+      return "Running command";
+    case "verifying":
+      return "Verifying";
+    case "reviewing":
+      return "Reviewing";
+    case "finalizing":
+      return "Finalizing";
+    case "done":
+      return "Done";
+    case "failed":
+      return "Failed";
+    case "cancelled":
+      return "Cancelled";
+    default:
+      return isActiveJobStatus(job?.status) ? "Working" : String(job?.status ?? "Idle");
+  }
+}
+
+function monitorSpinner() {
+  const frames = ["-", "\\", "|", "/"];
+  return frames[Math.floor(Date.now() / 250) % frames.length];
+}
+
+function buildCurrentActivityLine(job, activityEntries, width) {
+  if (!isActiveJobStatus(job?.status)) {
+    return `${"Now".padEnd(8)} ${formatPhaseLabel(job)}`;
+  }
+  const latest = activityEntries.at(-1) ?? null;
+  const age = latest ? formatAge(latest.iso) : "no events yet";
+  const detail = latest ? ` - ${latest.summary} (${age})` : " - waiting for first event";
+  return truncateLine(`${"Now".padEnd(8)} ${monitorSpinner()} ${formatPhaseLabel(job)}${detail}`, width);
+}
+
+function extractLogBlock(logFile, title) {
+  const logText = readLogText(logFile);
+  if (!logText) {
+    return "";
+  }
+  const lines = logText.split(/\r?\n/);
+  let start = -1;
+  for (let index = 0; index < lines.length; index += 1) {
+    const parsed = parseTimestampedLogLine(lines[index]);
+    if (parsed?.message === title) {
+      start = index + 1;
+    }
+  }
+  if (start === -1) {
+    return "";
+  }
+  const block = [];
+  for (let index = start; index < lines.length; index += 1) {
+    const parsed = parseTimestampedLogLine(lines[index]);
+    if (parsed) {
+      break;
+    }
+    block.push(lines[index]);
+  }
+  return block.join("\n").trim();
+}
+
+function formatOutputBlock(value, width, maxLines = Number.POSITIVE_INFINITY) {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    return [];
+  }
+  const lines = text
+    .split(/\r?\n/)
+    .flatMap((line) => (line.length > width ? wrapText(line, width, 4) : [line]))
+    .map((line) => truncateLine(line, width));
+  if (!Number.isFinite(maxLines) || maxLines <= 0) {
+    return lines;
+  }
+  return lines.slice(0, maxLines);
+}
+
+function getMonitorOutput(job, workspaceRoot, storedJob = null) {
+  const stored = storedJob ?? (job?.id ? readStoredJob(workspaceRoot, job.id) : null);
+  return (
+    stored?.result?.rawOutput ??
+    stored?.rendered ??
+    extractLogBlock(job?.logFile, "Final output") ??
+    ""
+  );
+}
+
+function selectSessionMonitorJob(cwd) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(workspaceRoot))).filter(
+    (job) => job.jobClass === "task"
+  );
+  const target = readSessionMonitorTarget(cwd);
+  const selected = target?.jobId ? jobs.find((job) => job.id === target.jobId) ?? null : null;
+  if (!selected) {
+    return { workspaceRoot, job: null, target };
+  }
+  return {
+    ...buildSingleJobSnapshot(cwd, selected.id, { maxProgressLines: 12 }),
+    target
+  };
+}
+
+function buildMonitorSnapshot(cwd, reference, options = {}) {
+  if (options.session) {
+    return selectSessionMonitorJob(cwd);
+  }
+  return buildSingleJobSnapshot(cwd, reference, { maxProgressLines: 12 });
+}
+
+function renderKeyValue(lines, key, value, width) {
+  if (!value) {
+    return;
+  }
+  lines.push(`${key.padEnd(8)} ${truncateLine(value, Math.max(10, width - 9))}`);
+}
+
+function buildMonitorContent(snapshot, options = {}) {
+  const width = terminalWidth();
+  const divider = dim("-".repeat(width));
+  const lines = [];
+  const sessionId = getCurrentClaudeSessionId();
+  const job = snapshot.job;
+  const target = snapshot.target ?? null;
+
+  lines.push(`${terminalStyle("1;36", "Codex Sidecar")} ${dim(new Date().toLocaleTimeString())}`);
+  lines.push(divider);
+  renderKeyValue(lines, "Workspace", snapshot.workspaceRoot, width);
+  if (options.session) {
+    renderKeyValue(lines, "Session", sessionId ?? "workspace", width);
+  }
+
+  if (!job) {
+    lines.push("");
+    lines.push(`${bold("Status")}   ${terminalStyle("33", "idle")}`);
+    lines.push("Waiting for the next Claude Code -> Codex handoff.");
+    if (target?.jobId) {
+      lines.push(dim(`Last requested job ${target.jobId} is no longer in the local job list.`));
+    }
+    lines.push("");
+    lines.push(dim("q closes this sidecar."));
+    return lines;
+  }
+
+  const storedJob = job.id ? readStoredJob(snapshot.workspaceRoot, job.id) : null;
+  const status = String(job.status ?? "unknown");
+  const phase = job.phase ? ` / ${job.phase}` : "";
+  const elapsed = job.elapsed ? ` (${job.elapsed})` : "";
+  lines.push("");
+  lines.push(`${bold("Current Handoff")}  ${terminalStyle(statusColor(status), `${status}${phase}`)}${elapsed}`);
+  const activityEntries = readActivityEntries(job.logFile);
+  renderKeyValue(lines, "Job", job.id, width);
+  if (job.threadId) {
+    renderKeyValue(lines, "Attach", `codex resume ${job.threadId}`, width);
+  }
+  if (isActiveJobStatus(job.status)) {
+    renderKeyValue(lines, "Cancel", `/codex:cancel ${job.id}`, width);
+  }
+  lines.push(buildCurrentActivityLine(job, activityEntries, width));
+
+  lines.push("");
+  lines.push(bold("Input"));
+  const inputSummary = storedJob?.summary ?? job.summary ?? job.title ?? "Codex Task";
+  const inputLines = wrapText(inputSummary, width, 4);
+  lines.push(...(inputLines.length ? inputLines : [dim("No prompt summary available.")]));
+
+  const output = getMonitorOutput(job, snapshot.workspaceRoot, storedJob);
+  const outputLines = formatOutputBlock(output, width);
+
+  lines.push("");
+  lines.push(bold(isActiveJobStatus(job.status) ? "Live Activity" : "Output"));
+  lines.push(divider);
+
+  if (!isActiveJobStatus(job.status) && outputLines.length) {
+    lines.push(...outputLines);
+  } else {
+    const activityLines = activityEntries.map((entry) => truncateLine(`${entry.time}  ${entry.summary}`, width));
+    lines.push(...(activityLines.length ? activityLines : [dim("Waiting for progress events.")]));
+    if (outputLines.length) {
+      lines.push("");
+      lines.push(bold("Latest Response"));
+      lines.push(...outputLines);
+    }
+  }
+
+  lines.push("");
+  if (options.session) {
+    const footer = isActiveJobStatus(job.status)
+      ? "New handoffs replace this view. q closes it."
+      : "Finished. Waiting for the next handoff. q closes it.";
+    lines.push(dim(footer));
+  } else if (!isActiveJobStatus(job.status)) {
+    lines.push(dim("Job finished."));
+  }
+  return lines;
+}
+
+function clampScrollOffset(value, maxScroll) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return 0;
+  }
+  return Math.max(0, Math.min(Math.trunc(numeric), maxScroll));
+}
+
+function renderMonitorScreen(snapshot, options = {}) {
+  const height = terminalHeight();
+  const contentLines = buildMonitorContent(snapshot, options);
+  const footerLines = process.stdout.isTTY
+    ? 1
+    : 0;
+  const viewportHeight = Math.max(1, height - footerLines);
+  const maxScroll = Math.max(0, contentLines.length - viewportHeight);
+  const scrollOffset = clampScrollOffset(options.scrollOffset ?? 0, maxScroll);
+  const visibleLines = contentLines.slice(scrollOffset, scrollOffset + viewportHeight);
+
+  while (visibleLines.length < viewportHeight) {
+    visibleLines.push("");
+  }
+
+  if (footerLines) {
+    const position = maxScroll > 0
+      ? `${scrollOffset + 1}-${Math.min(contentLines.length, scrollOffset + viewportHeight)}/${contentLines.length}`
+      : `1-${contentLines.length}/${contentLines.length}`;
+    const controls = maxScroll > 0
+      ? `Scroll ${position}  wheel ↑/↓ PgUp/PgDn Home/End  q quit`
+      : `q quit`;
+    visibleLines.push(dim(controls));
+  }
+
+  return {
+    rendered: `${visibleLines.join("\n")}\n`,
+    maxScroll,
+    scrollOffset,
+    contentLines: contentLines.length
+  };
+}
+
+function enterMonitorScreen() {
+  if (!process.stdout.isTTY) {
+    return () => {};
+  }
+  process.stdout.write("\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?25l\x1b[2J\x1b[H");
+  let cleaned = false;
+  return () => {
+    if (cleaned) {
+      return;
+    }
+    cleaned = true;
+    process.stdout.write("\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l");
+  };
+}
+
+function renderMonitorFrame(rendered) {
+  if (process.stdout.isTTY) {
+    process.stdout.write("\x1b[H\x1b[2J");
+  }
+  process.stdout.write(rendered);
+}
+
+async function waitForMonitorHold() {
+  if (!process.stdin.isTTY) {
+    return;
+  }
+  process.stdout.write("\nMonitor ended. Press Enter to close.");
+  await new Promise((resolve) => {
+    process.stdin.resume();
+    process.stdin.once("data", resolve);
+  });
+}
+
+function installMonitorCleanup(cwd, restoreScreen = () => {}) {
+  writeSessionMonitorRecord(cwd, {
+    pid: process.pid,
+    sessionId: getCurrentClaudeSessionId(),
+    workspaceRoot: resolveWorkspaceRoot(cwd),
+    openedAt: nowIso()
+  });
+
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) {
+      return;
+    }
+    cleaned = true;
+    removeSessionMonitorRecord(cwd, process.pid);
+    restoreScreen();
+  };
+  process.once("exit", cleanup);
+  process.once("SIGINT", () => {
+    cleanup();
+    process.exit(0);
+  });
+  process.once("SIGTERM", () => {
+    cleanup();
+    process.exit(0);
+  });
+  return cleanup;
+}
+
+function interpretMonitorKey(chunk) {
+  const sgrMouse = /\x1b\[<(\d+);\d+;\d+([mM])/.exec(chunk);
+  if (sgrMouse) {
+    const code = Number(sgrMouse[1]);
+    if (sgrMouse[2] === "M" && (code === 64 || code === 96)) {
+      return { type: "scroll", delta: -3 };
+    }
+    if (sgrMouse[2] === "M" && (code === 65 || code === 97)) {
+      return { type: "scroll", delta: 3 };
+    }
+  }
+
+  const legacyMouseIndex = chunk.indexOf("\x1b[M");
+  if (legacyMouseIndex !== -1 && chunk.length >= legacyMouseIndex + 4) {
+    const code = chunk.charCodeAt(legacyMouseIndex + 3) - 32;
+    if (code === 64) {
+      return { type: "scroll", delta: -3 };
+    }
+    if (code === 65) {
+      return { type: "scroll", delta: 3 };
+    }
+  }
+
+  switch (chunk) {
+    case "q":
+    case "Q":
+    case "\u0003":
+      return { type: "quit" };
+    case "\u001b[A":
+    case "k":
+      return { type: "scroll", delta: -1 };
+    case "\u001b[B":
+    case "j":
+      return { type: "scroll", delta: 1 };
+    case "\u001b[5~":
+    case "\u0002":
+      return { type: "page", direction: -1 };
+    case "\u001b[6~":
+    case "\u0006":
+      return { type: "page", direction: 1 };
+    case "\u001b[H":
+    case "\u001b[1~":
+    case "g":
+      return { type: "home" };
+    case "\u001b[F":
+    case "\u001b[4~":
+    case "G":
+      return { type: "end" };
+    default:
+      return null;
+  }
+}
+
+function installMonitorKeyControls(onAction) {
+  if (!process.stdin.isTTY) {
+    return () => {};
+  }
+  const previousRawMode = process.stdin.isRaw;
+  process.stdin.setRawMode(true);
+  process.stdin.setEncoding("utf8");
+  process.stdin.resume();
+  const onData = (chunk) => {
+    const action = interpretMonitorKey(String(chunk));
+    if (action) {
+      onAction(action);
+    }
+  };
+  process.stdin.on("data", onData);
+  return () => {
+    process.stdin.off("data", onData);
+    process.stdin.setRawMode(Boolean(previousRawMode));
+    process.stdin.pause();
+  };
+}
+
+async function handleMonitor(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "poll-interval-ms"],
+    booleanOptions: ["follow", "hold", "session"]
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const sessionMode = Boolean(options.session);
+  const reference = positionals[0] ?? "";
+  if (!reference && !sessionMode) {
+    throw new Error("monitor requires a job id. Run /codex:status to list jobs.");
+  }
+
+  const restoreScreen = sessionMode ? enterMonitorScreen() : () => {};
+  const cleanupMonitor = sessionMode ? installMonitorCleanup(cwd, restoreScreen) : () => {};
+
+  const pollIntervalMs = Math.max(100, Number(options["poll-interval-ms"]) || 250);
+  let lastRendered = "";
+  let scrollOffset = 0;
+  let maxScroll = 0;
+  let forceRender = true;
+  let shouldQuit = false;
+  let lastSnapshot = null;
+
+  const renderNow = () => {
+    if (!lastSnapshot) {
+      return;
+    }
+    const frame = renderMonitorScreen(lastSnapshot, { session: sessionMode, scrollOffset });
+    scrollOffset = frame.scrollOffset;
+    maxScroll = frame.maxScroll;
+    if (forceRender || frame.rendered !== lastRendered) {
+      renderMonitorFrame(frame.rendered);
+      lastRendered = frame.rendered;
+      forceRender = false;
+    }
+  };
+
+  const cleanupKeys = sessionMode
+    ? installMonitorKeyControls((action) => {
+        const pageSize = Math.max(1, terminalHeight() - 4);
+        switch (action.type) {
+          case "quit":
+            shouldQuit = true;
+            break;
+          case "scroll":
+            scrollOffset = clampScrollOffset(scrollOffset + action.delta, maxScroll);
+            break;
+          case "page":
+            scrollOffset = clampScrollOffset(scrollOffset + action.direction * pageSize, maxScroll);
+            break;
+          case "home":
+            scrollOffset = 0;
+            break;
+          case "end":
+            scrollOffset = maxScroll;
+            break;
+          default:
+            break;
+        }
+        forceRender = true;
+        renderNow();
+      })
+    : () => {};
+
+  try {
+    while (true) {
+      lastSnapshot = buildMonitorSnapshot(cwd, reference, { session: sessionMode });
+      forceRender = forceRender || Boolean(lastSnapshot.job && isActiveJobStatus(lastSnapshot.job.status));
+      renderNow();
+
+      const active = lastSnapshot.job ? isActiveJobStatus(lastSnapshot.job.status) : false;
+      if (shouldQuit || !options.follow || (!sessionMode && !active)) {
+        break;
+      }
+      await sleep(pollIntervalMs);
+    }
+  } finally {
+    cleanupKeys();
+    if (sessionMode) {
+      cleanupMonitor();
+    }
+  }
+
+  if (options.hold && !sessionMode) {
+    await waitForMonitorHold();
+  }
 }
 
 async function handleTaskWorker(argv) {
@@ -999,6 +1865,9 @@ async function main() {
       break;
     case "task":
       await handleTask(argv);
+      break;
+    case "monitor":
+      await handleMonitor(argv);
       break;
     case "task-worker":
       await handleTaskWorker(argv);
