@@ -10,7 +10,7 @@ import { getCodexAvailability } from "./lib/codex.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { getConfig, listJobs } from "./lib/state.mjs";
 import { sortJobsNewestFirst } from "./lib/job-control.mjs";
-import { SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
+import { SESSION_ID_ENV, resolveClaudeSessionId, withResolvedSessionEnv } from "./lib/session.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 const STOP_REVIEW_TIMEOUT_MS = 15 * 60 * 1000;
@@ -38,7 +38,7 @@ function logNote(message) {
 }
 
 function filterJobsForCurrentSession(jobs, input = {}) {
-  const sessionId = input.session_id || process.env[SESSION_ID_ENV] || null;
+  const sessionId = input.session_id || resolveClaudeSessionId();
   if (!sessionId) {
     return jobs;
   }
@@ -99,7 +99,7 @@ function runStopReview(cwd, input = {}) {
   const scriptPath = path.join(SCRIPT_DIR, "codex-companion.mjs");
   const prompt = buildStopReviewPrompt(input);
   const childEnv = {
-    ...process.env,
+    ...withResolvedSessionEnv(process.env),
     ...(input.session_id ? { [SESSION_ID_ENV]: input.session_id } : {})
   };
   const result = spawnSync(process.execPath, [scriptPath, "task", "--json", prompt], {

@@ -2,7 +2,7 @@ import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
 import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
-import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
+import { resolveClaudeSessionId } from "./session.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 8;
@@ -13,7 +13,7 @@ export function sortJobsNewestFirst(jobs) {
 }
 
 function getCurrentSessionId(options = {}) {
-  return options.env?.[SESSION_ID_ENV] ?? process.env[SESSION_ID_ENV] ?? null;
+  return resolveClaudeSessionId(options.env ?? process.env);
 }
 
 function filterJobsForCurrentSession(jobs, options = {}) {

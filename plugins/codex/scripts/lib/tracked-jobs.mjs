@@ -2,8 +2,9 @@ import fs from "node:fs";
 import process from "node:process";
 
 import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import { SESSION_ID_ENV, resolveClaudeSessionId } from "./session.mjs";
 
-export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
+export { SESSION_ID_ENV };
 
 export function nowIso() {
   return new Date().toISOString();
@@ -59,7 +60,10 @@ export function createJobLogFile(workspaceRoot, jobId, title) {
 
 export function createJobRecord(base, options = {}) {
   const env = options.env ?? process.env;
-  const sessionId = env[options.sessionIdEnv ?? SESSION_ID_ENV];
+  const sessionId =
+    options.sessionIdEnv && options.sessionIdEnv !== SESSION_ID_ENV
+      ? env[options.sessionIdEnv]
+      : resolveClaudeSessionId(env);
   return {
     ...base,
     createdAt: nowIso(),

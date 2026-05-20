@@ -48,9 +48,9 @@ import {
   createJobRecord,
   createProgressReporter,
   nowIso,
-  runTrackedJob,
-  SESSION_ID_ENV
+  runTrackedJob
 } from "./lib/tracked-jobs.mjs";
+import { formatSessionLabel, resolveClaudeSessionId, withResolvedSessionEnv } from "./lib/session.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import {
   renderNativeReviewResult,
@@ -293,7 +293,7 @@ function isActiveJobStatus(status) {
 }
 
 function getCurrentClaudeSessionId() {
-  return process.env[SESSION_ID_ENV] ?? null;
+  return resolveClaudeSessionId();
 }
 
 function filterJobsForCurrentClaudeSession(jobs) {
@@ -730,7 +730,7 @@ function openMonitorTerminal(cwd, jobId, options = {}) {
     ],
     {
       cwd,
-      env: process.env,
+      env: withResolvedSessionEnv(process.env),
       detached: true,
       stdio: "ignore",
       windowsHide: true
@@ -823,7 +823,7 @@ function spawnDetachedTaskWorker(cwd, jobId) {
   const scriptPath = path.join(ROOT_DIR, "scripts", "codex-companion.mjs");
   const child = spawn(process.execPath, [scriptPath, "task-worker", "--cwd", cwd, "--job-id", jobId], {
     cwd,
-    env: process.env,
+    env: withResolvedSessionEnv(process.env),
     detached: true,
     stdio: "ignore",
     windowsHide: true
@@ -1285,17 +1285,19 @@ function getMonitorOutput(job, workspaceRoot, storedJob = null) {
 
 function selectSessionMonitorJob(cwd) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const sessionId = getCurrentClaudeSessionId();
   const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(workspaceRoot))).filter(
     (job) => job.jobClass === "task"
   );
   const target = readSessionMonitorTarget(cwd);
   const selected = target?.jobId ? jobs.find((job) => job.id === target.jobId) ?? null : null;
   if (!selected) {
-    return { workspaceRoot, job: null, target };
+    return { workspaceRoot, job: null, target, sessionId };
   }
   return {
     ...buildSingleJobSnapshot(cwd, selected.id, { maxProgressLines: 12 }),
-    target
+    target,
+    sessionId
   };
 }
 
@@ -1303,7 +1305,10 @@ function buildMonitorSnapshot(cwd, reference, options = {}) {
   if (options.session) {
     return selectSessionMonitorJob(cwd);
   }
-  return buildSingleJobSnapshot(cwd, reference, { maxProgressLines: 12 });
+  return {
+    ...buildSingleJobSnapshot(cwd, reference, { maxProgressLines: 12 }),
+    sessionId: getCurrentClaudeSessionId()
+  };
 }
 
 function renderKeyValue(lines, key, value, width) {
@@ -1317,7 +1322,7 @@ function buildMonitorContent(snapshot, options = {}) {
   const width = terminalWidth();
   const divider = dim("-".repeat(width));
   const lines = [];
-  const sessionId = getCurrentClaudeSessionId();
+  const sessionId = snapshot.sessionId ?? getCurrentClaudeSessionId();
   const job = snapshot.job;
   const target = snapshot.target ?? null;
 
@@ -1325,7 +1330,7 @@ function buildMonitorContent(snapshot, options = {}) {
   lines.push(divider);
   renderKeyValue(lines, "Workspace", snapshot.workspaceRoot, width);
   if (options.session) {
-    renderKeyValue(lines, "Session", sessionId ?? "workspace", width);
+    renderKeyValue(lines, "Claude", formatSessionLabel(sessionId), width);
   }
 
   if (!job) {

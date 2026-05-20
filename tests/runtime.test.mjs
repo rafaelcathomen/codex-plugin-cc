@@ -562,6 +562,87 @@ test("session start hook exports the Claude session id and plugin data dir for l
   );
 });
 
+test("task commands recover Claude session id from the Claude env file", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const envFile = path.join(makeTempDir(), "claude-env.sh");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(envFile, "export CODEX_COMPANION_SESSION_ID='sess-from-file'\n", "utf8");
+
+  const result = run("node", [SCRIPT, "task", "--write", "fix the failing test"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_COMPANION_SESSION_ID: "",
+      CLAUDE_ENV_FILE: envFile
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const state = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "state.json"), "utf8"));
+  assert.equal(state.jobs[0].sessionId, "sess-from-file");
+});
+
+test("task-resume-candidate filters by session id recovered from the Claude env file", () => {
+  const workspace = makeTempDir();
+  const envFile = path.join(makeTempDir(), "claude-env.sh");
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+  fs.writeFileSync(envFile, "export CODEX_COMPANION_SESSION_ID='sess-current'\n", "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "task-other",
+            status: "completed",
+            title: "Codex Task",
+            jobClass: "task",
+            sessionId: "sess-other",
+            threadId: "thr_other",
+            summary: "Other session task",
+            updatedAt: "2026-03-24T20:05:00.000Z"
+          },
+          {
+            id: "task-current",
+            status: "completed",
+            title: "Codex Task",
+            jobClass: "task",
+            sessionId: "sess-current",
+            threadId: "thr_current",
+            summary: "Current session task",
+            updatedAt: "2026-03-24T20:00:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "task-resume-candidate", "--json"], {
+    cwd: workspace,
+    env: {
+      ...process.env,
+      CODEX_COMPANION_SESSION_ID: "",
+      CLAUDE_ENV_FILE: envFile
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.sessionId, "sess-current");
+  assert.equal(payload.candidate.id, "task-current");
+});
+
 test("write task output focuses on the Codex result without generic follow-up hints", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
